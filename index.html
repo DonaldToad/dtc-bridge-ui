@@ -1,0 +1,92 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DTC Bridge (Test UI)</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <div>
+        <h1>DTC Bridge (Test UI)</h1>
+        <div class="sub">Linea ↔ Base • LayerZero V2 OFT</div>
+      </div>
+      <button id="btnConnect">Connect Wallet</button>
+    </div>
+
+    <div class="row">
+      <button id="btnSwitchLinea">Switch to Linea</button>
+      <button id="btnSwitchBase">Switch to Base</button>
+      <div id="netLine" class="pill">Network: —</div>
+    </div>
+
+    <div class="grid">
+      <div>
+        <label>Direction</label>
+        <select id="direction">
+          <option value="LINEA_TO_BASE">Linea → Base</option>
+          <option value="BASE_TO_LINEA">Base → Linea</option>
+        </select>
+      </div>
+
+      <div>
+        <label>Amount (DTC)</label>
+        <input id="amount" placeholder="e.g. 69" />
+        <div id="balLine" class="hint">Balance: —</div>
+      </div>
+
+      <div>
+        <label>Slippage (min receive, %)</label>
+        <input id="slippage" value="0.5" />
+        <div class="hint">Example: 0.5 means minAmount = 99.5% of amount</div>
+      </div>
+
+      <div>
+        <label>Destination gas (lzReceive)</label>
+        <input id="lzGas" value="200000" />
+        <div class="hint">Start with 200k. If dst execution needs more, increase.</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <button id="btnRefresh">Refresh</button>
+      <button id="btnQuote">Quote Native Fee</button>
+      <button id="btnApprove">Approve (if needed)</button>
+      <button id="btnSend">Send</button>
+    </div>
+
+    <div class="grid small">
+      <div><div class="label">Wallet</div><div id="walletLine">Not connected</div></div>
+      <div><div class="label">Spender (approve)</div><div id="spenderLine">—</div></div>
+      <div><div class="label">Send Contract</div><div id="senderLine">—</div></div>
+      <div><div class="label">Peer (dstEid)</div><div id="peerLine">—</div></div>
+      <div><div class="label">Quoted Native Fee</div><div id="feeLine">—</div></div>
+    </div>
+
+    <details class="debug">
+      <summary>Debug (optional): RPC URL for reliable revert decoding</summary>
+      <div class="grid">
+        <div>
+          <label>Debug RPC (Linea)</label>
+          <input id="rpcLinea" placeholder="https://linea-mainnet.g.alchemy.com/v2/..." />
+        </div>
+        <div>
+          <label>Debug RPC (Base)</label>
+          <input id="rpcBase" placeholder="https://base-mainnet.g.alchemy.com/v2/..." />
+        </div>
+      </div>
+      <button id="btnSimulate">Simulate (eth_call)</button>
+    </details>
+
+    <div class="logHeader">
+      <div>Log</div>
+      <button id="btnClear">Clear</button>
+    </div>
+    <pre id="log" class="log"></pre>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
