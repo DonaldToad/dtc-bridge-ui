@@ -3,11 +3,8 @@ import { Options } from "https://esm.sh/@layerzerolabs/lz-v2-utilities@3.0.85";
 
 // ========= YOUR CONSTANTS =========
 const ADDRS = {
-  // Base
   BASE_OFT: "0xFbA669C72b588439B29F050b93500D8b645F9354",
   BASE_ROUTER: "0x480C0d523511dd96A65A38f36aaEF69aC2BaA82a",
-
-  // Linea
   LINEA_ADAPTER: "0x54B4E88E9775647614440Acc8B13A079277fa2A6",
   DTC_LINEA: "0xEb1fD1dBB8aDDA4fa2b5A5C4bcE34F6F20d125D2",
 };
@@ -17,7 +14,7 @@ const CHAINS = {
   LINEA: { chainId: 59144, name: "Linea", eid: 30183, currency: "ETH" },
 };
 
-// ========= Minimal ABIs =========
+// ========= ABIs =========
 const ERC20_ABI = [
   "function symbol() view returns (string)",
   "function decimals() view returns (uint8)",
@@ -26,48 +23,54 @@ const ERC20_ABI = [
   "function approve(address spender, uint256 amount) returns (bool)",
 ];
 
-// OFT / Adapter quote+send+peer (OFT v2 style)
+// OFT/Adapter interface (peer + quoteSend + send)
 const OFT_ABI = [
   "function peer(uint32 dstEid) view returns (bytes32)",
   "function quoteSend((uint32 dstEid,bytes32 to,uint256 amountLD,uint256 minAmountLD,bytes extraOptions,bytes composeMsg,bytes oftCmd) p, bool payInLzToken) view returns (uint256 nativeFee, uint256 lzTokenFee)",
-  "function send((uint32 dstEid,bytes32 to,uint256 amountLD,uint256 minAmountLD,bytes extraOptions,bytes composeMsg,bytes oftCmd) p, (uint256 nativeFee, uint256 lzTokenFee) fee, address refundAddress) payable returns (bytes32 guid, uint64 nonce, (uint256 amountSentLD,uint256 amountReceivedLD) receipt)",
+  "function send((uint32 dstEid,bytes32 to,uint256 amountLD,uint256 minAmountLD,bytes extraOptions,bytes composeMsg,bytes oftCmd) p, (uint256 nativeFee, uint256 lzTokenFee) fee, address refundAddress) payable returns (bytes32 guid, uint64 nonce, (uint256 amountSentLD,uint256 amountReceivedLD) receipt)"
 ];
 
-// Router only needs send (many routers don’t expose quoteSend)
+// Router often exposes the same quoteSend/send surface:
 const ROUTER_ABI = [
-  "function send((uint32 dstEid,bytes32 to,uint256 amountLD,uint256 minAmountLD,bytes extraOptions,bytes composeMsg,bytes oftCmd) p, (uint256 nativeFee, uint256 lzTokenFee) fee, address refundAddress) payable",
+  "function quoteSend((uint32 dstEid,bytes32 to,uint256 amountLD,uint256 minAmountLD,bytes extraOptions,bytes composeMsg,bytes oftCmd) p, bool payInLzToken) view returns (uint256 nativeFee, uint256 lzTokenFee)",
+  "function send((uint32 dstEid,bytes32 to,uint256 amountLD,uint256 minAmountLD,bytes extraOptions,bytes composeMsg,bytes oftCmd) p, (uint256 nativeFee, uint256 lzTokenFee) fee, address refundAddress) payable"
 ];
 
-// ========= UI =========
+// ========= UI helpers =========
 const $ = (id) => document.getElementById(id);
 
+const LOG_KEY = "dtc_bridge_log_v1";
 const logEl = $("log");
+
+function loadLog() {
+  const saved = localStorage.getItem(LOG_KEY);
+  if (saved) logEl.textContent = saved;
+}
+function saveLog() {
+  localStorage.setItem(LOG_KEY, logEl.textContent.slice(-50000)); // keep last ~50k chars
+}
 function log(msg) {
   const t = new Date().toLocaleTimeString();
   logEl.textContent += `[${t}] ${msg}\n`;
   logEl.scrollTop = logEl.scrollHeight;
+  saveLog();
 }
-
 function short(addr) {
   if (!addr) return "—";
   return addr.slice(0, 6) + "..." + addr.slice(-4);
 }
-
 function toBytes32Address(addr) {
   return ethers.zeroPadValue(addr, 32);
 }
-
 function percentToMin(amountBN, slippagePct) {
   const slip = Number(slippagePct);
-  const bps = Math.max(0, Math.min(100, slip)) * 100; // 0..10000
+  const bps = Math.max(0, Math.min(100, slip)) * 100; // 0..10000 bps
   const keepBps = 10000 - Math.round(bps);
   return (amountBN * BigInt(keepBps)) / 10000n;
 }
-
 function buildOptionsBytes(lzGas) {
   const gas = Number(lzGas);
-  if (!Number.isFinite(gas) || gas <= 0) throw new Error("Invalid dst gas");
-  // This prevents the InvalidWorkerId(0x6780cfaf) class of issues:
+  if (!Number.isFinite(gas) || gas <= 0) throw new Error("Invalid lzGas");
   return Options.newOptions().addExecutorLzReceiveOption(gas, 0).toBytes();
 }
 
@@ -75,6 +78,11 @@ function buildOptionsBytes(lzGas) {
 let browserProvider = null;
 let signer = null;
 let userAddress = null;
+
+// Prevent race conditions when chain changes mid-call
+let sessionNonce = 0;
+function bumpSession() { sessionNonce++; }
+function mySession(n) { return n === sessionNonce; }
 
 function requireEthereum() {
   if (!window.ethereum) {
@@ -84,43 +92,48 @@ function requireEthereum() {
   return window.ethereum;
 }
 
-async function initProviderAndSigner() {
-  const eth = requireEthereum();
-  browserProvider = new ethers.BrowserProvider(eth);
-  signer = await browserProvider.getSigner();
-  userAddress = await signer.getAddress();
-  $("walletLine").textContent = `Connected: ${short(userAddress)} (${userAddress})`;
-}
-
+// We do NOT hard-reload on chainChanged.
+// Instead, we recreate provider+signer and keep logs.
 function installChainListeners() {
   const eth = requireEthereum();
 
-  // Don’t hard reload; just re-init provider/signer and keep logs
   eth.removeAllListeners?.("chainChanged");
   eth.on?.("chainChanged", async () => {
-    try {
-      log("Network changed. Re-initializing provider...");
-      await initProviderAndSigner();
-      await refreshAll();
-    } catch (e) {
-      log(`Re-init after chainChanged failed: ${e?.message || e}`);
-    }
+    bumpSession();
+    log(`Network changed. Re-initializing provider...`);
+    await reinitProvider();
   });
 
   eth.removeAllListeners?.("accountsChanged");
   eth.on?.("accountsChanged", async (accs) => {
+    bumpSession();
     if (!accs || !accs.length) return;
-    try {
-      log("Account changed. Re-initializing provider...");
-      await initProviderAndSigner();
-      await refreshAll();
-    } catch (e) {
-      log(`Re-init after accountsChanged failed: ${e?.message || e}`);
-    }
+    log(`Account changed. Re-initializing provider...`);
+    await reinitProvider();
   });
 }
 
+async function reinitProvider() {
+  const eth = requireEthereum();
+  browserProvider = new ethers.BrowserProvider(eth);
+  signer = await browserProvider.getSigner();
+  userAddress = await signer.getAddress();
+
+  $("walletLine").textContent = `Connected: ${short(userAddress)} (${userAddress})`;
+  await refreshAll();
+}
+
+async function connect() {
+  const eth = requireEthereum();
+  installChainListeners();
+
+  await eth.request({ method: "eth_requestAccounts" });
+  await reinitProvider();
+  log(`Connected: ${userAddress}`);
+}
+
 async function getChainId() {
+  if (!browserProvider) return null;
   const net = await browserProvider.getNetwork();
   return Number(net.chainId);
 }
@@ -129,11 +142,16 @@ function getDirection() {
   return $("direction").value;
 }
 
-/**
- * IMPORTANT FIX:
- * - Linea→Base: quote+send on Linea Adapter, approve Adapter to spend canonical token.
- * - Base→Linea: quote on Base OFT, BUT send on Base Router, approve Router to spend OFT.
- */
+function setDirectionHint(meta) {
+  $("directionHint").textContent =
+    (meta.from.chainId === CHAINS.LINEA.chainId)
+      ? "Linea is canonical (adapter lock/unlock). Base OFT is minted/burned."
+      : "Base uses Router for bridging. Do NOT call OFT.send directly.";
+}
+
+// IMPORTANT FIX:
+// - Linea→Base: approve DTC to LINEA_ADAPTER, call ADAPTER.quoteSend/send
+// - Base→Linea: approve Base OFT to BASE_ROUTER, call ROUTER.quoteSend/send
 function directionMeta() {
   const dir = getDirection();
 
@@ -141,33 +159,26 @@ function directionMeta() {
     return {
       from: CHAINS.LINEA,
       to: CHAINS.BASE,
-
-      // token you hold/spend on Linea
       token: ADDRS.DTC_LINEA,
       spender: ADDRS.LINEA_ADAPTER,
-
-      // quote+send contract
       quoteContract: ADDRS.LINEA_ADAPTER,
+      quoteAbi: OFT_ABI,
       sendContract: ADDRS.LINEA_ADAPTER,
-
-      peerReader: ADDRS.LINEA_ADAPTER, // has peer()
+      sendAbi: OFT_ABI,
+      peerReadContract: ADDRS.LINEA_ADAPTER
     };
   }
 
-  // BASE_TO_LINEA
   return {
     from: CHAINS.BASE,
     to: CHAINS.LINEA,
-
-    // token you hold/spend on Base
     token: ADDRS.BASE_OFT,
-    spender: ADDRS.BASE_ROUTER, // approve ROUTER (not OFT)
-
-    // quote on OFT, send on ROUTER
-    quoteContract: ADDRS.BASE_OFT,
-    sendContract: ADDRS.BASE_ROUTER,
-
-    peerReader: ADDRS.BASE_OFT, // peer() usually on OFT (not router)
+    spender: ADDRS.BASE_ROUTER,         // ✅ approve ROUTER
+    quoteContract: ADDRS.BASE_ROUTER,   // ✅ quote on ROUTER
+    quoteAbi: ROUTER_ABI,
+    sendContract: ADDRS.BASE_ROUTER,    // ✅ send via ROUTER
+    sendAbi: ROUTER_ABI,
+    peerReadContract: ADDRS.BASE_OFT    // peer is typically on OFT
   };
 }
 
@@ -179,24 +190,22 @@ async function switchNetwork(chainIdDec) {
   try {
     await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: hex }] });
   } catch (e) {
-    const msg = String(e?.message || "");
-    if (e?.code === 4902 || msg.includes("Unrecognized chain") || msg.includes("not been added")) {
-      const params =
-        chainIdDec === CHAINS.LINEA.chainId
-          ? {
-              chainId: hex,
-              chainName: "Linea",
-              nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
-              rpcUrls: ["https://rpc.linea.build"],
-              blockExplorerUrls: ["https://lineascan.build"],
-            }
-          : {
-              chainId: hex,
-              chainName: "Base",
-              nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
-              rpcUrls: ["https://mainnet.base.org"],
-              blockExplorerUrls: ["https://basescan.org"],
-            };
+    if (e && (e.code === 4902 || String(e.message || "").includes("Unrecognized chain"))) {
+      const params = (chainIdDec === CHAINS.LINEA.chainId)
+        ? {
+            chainId: hex,
+            chainName: "Linea",
+            nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+            rpcUrls: ["https://rpc.linea.build"],
+            blockExplorerUrls: ["https://lineascan.build"]
+          }
+        : {
+            chainId: hex,
+            chainName: "Base",
+            nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+            rpcUrls: ["https://mainnet.base.org"],
+            blockExplorerUrls: ["https://basescan.org"]
+          };
       await eth.request({ method: "wallet_addEthereumChain", params: [params] });
       await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: hex }] });
     } else {
@@ -210,38 +219,32 @@ async function getTokenMeta(tokenAddr) {
   const [sym, dec] = await Promise.all([token.symbol(), token.decimals()]);
   return { token, sym, dec: Number(dec) };
 }
-
 function parseAmount(amountStr, decimals) {
   if (!amountStr || isNaN(Number(amountStr))) throw new Error("Invalid amount");
   return ethers.parseUnits(amountStr, decimals);
 }
-
 function formatAmount(amountBN, decimals) {
   return ethers.formatUnits(amountBN, decimals);
 }
 
-async function readPeer(peerReaderAddr, dstEid) {
-  const c = new ethers.Contract(peerReaderAddr, OFT_ABI, browserProvider);
+async function readPeer(peerReadContract, dstEid) {
+  const c = new ethers.Contract(peerReadContract, ["function peer(uint32) view returns (bytes32)"], browserProvider);
   const peerBytes32 = await c.peer(dstEid);
   const asAddr = ethers.getAddress("0x" + peerBytes32.slice(26));
   return { peerBytes32, asAddr };
 }
 
-function buildSendParam(meta, amount, minAmount, extraOptions) {
-  return {
-    dstEid: meta.to.eid,
-    to: toBytes32Address(userAddress),
-    amountLD: amount,
-    minAmountLD: minAmount,
-    extraOptions: ethers.hexlify(extraOptions),
-    composeMsg: "0x",
-    oftCmd: "0x",
-  };
-}
-
 async function quote() {
+  const n = sessionNonce;
+  if (!signer) throw new Error("Not connected");
+
   const meta = directionMeta();
+  setDirectionHint(meta);
+
   const chainId = await getChainId();
+  $("netLine").textContent = `Network: ${chainId ?? "—"}`;
+
+  if (!mySession(n)) return;
 
   if (chainId !== meta.from.chainId) {
     log(`Wrong network. Switching to ${meta.from.name}...`);
@@ -250,6 +253,7 @@ async function quote() {
   }
 
   const { token, sym, dec } = await getTokenMeta(meta.token);
+  if (!mySession(n)) return;
 
   const amountStr = $("amount").value.trim();
   const slipStr = $("slippage").value.trim();
@@ -257,52 +261,71 @@ async function quote() {
 
   const amount = parseAmount(amountStr, dec);
   const minAmount = percentToMin(amount, slipStr);
+  const toB32 = toBytes32Address(userAddress);
   const extraOptions = buildOptionsBytes(lzGas);
 
-  const sendParam = buildSendParam(meta, amount, minAmount, extraOptions);
+  const p = {
+    dstEid: meta.to.eid,
+    to: toB32,
+    amountLD: amount,
+    minAmountLD: minAmount,
+    extraOptions: ethers.hexlify(extraOptions),
+    composeMsg: "0x",
+    oftCmd: "0x"
+  };
 
-  // peer sanity
-  const peer = await readPeer(meta.peerReader, meta.to.eid);
-  $("peerLine").textContent = `${peer.asAddr} (bytes32: ${peer.peerBytes32})`;
-  log(`Diag: peer=${peer.asAddr}`);
-
-  // quote on quoteContract (OFT or Adapter)
-  const quoteC = new ethers.Contract(meta.quoteContract, OFT_ABI, browserProvider);
-
-  log(`Quote: ${meta.from.name} → ${meta.to.name} quoteOn=${meta.quoteContract} amount=${amountStr} min=${formatAmount(minAmount, dec)} ${sym}`);
-
-  const res = await quoteC.quoteSend(sendParam, false);
-  const nativeFee = res[0];
-  const lzTokenFee = res[1];
-
-  $("feeLine").textContent = `${ethers.formatEther(nativeFee)} ${meta.from.currency}`;
   $("spenderLine").textContent = meta.spender;
   $("senderLine").textContent = meta.sendContract;
 
+  log(`Quote: ${meta.from.name} → ${meta.to.name} quoteOn=${meta.quoteContract} amount=${amountStr} min=${formatAmount(minAmount, dec)} ${sym}`);
+
+  // Peer sanity
+  try {
+    const peer = await readPeer(meta.peerReadContract, meta.to.eid);
+    $("peerLine").textContent = `${peer.asAddr} (bytes32: ${peer.peerBytes32})`;
+    log(`Diag: peer=${peer.asAddr}`);
+  } catch (e) {
+    $("peerLine").textContent = `— (peer read failed)`;
+    log(`Peer read failed: ${e?.shortMessage || e?.message || e}`);
+  }
+
+  const q = new ethers.Contract(meta.quoteContract, meta.quoteAbi, browserProvider);
+  const res = await q.quoteSend(p, false);
+  const nativeFee = res[0];
+  $("feeLine").textContent = `${ethers.formatEther(nativeFee)} ${meta.from.currency}`;
   log(`Native fee: ${ethers.formatEther(nativeFee)} ${meta.from.currency}`);
-  return { meta, token, sym, dec, amountStr, amount, minAmount, sendParam, nativeFee, lzTokenFee };
+
+  return { meta, token, sym, dec, p, nativeFee };
 }
 
-async function approveIfNeeded(q) {
-  const meta = q.meta;
+async function approveIfNeeded() {
+  const n = sessionNonce;
+  if (!signer) throw new Error("Not connected");
+
+  const meta = directionMeta();
   const chainId = await getChainId();
+  if (!mySession(n)) return false;
+
   if (chainId !== meta.from.chainId) {
     log(`Wrong network. Switching to ${meta.from.name}...`);
     await switchNetwork(meta.from.chainId);
     return false;
   }
 
-  const token = q.token;
-  const allowance = await token.allowance(userAddress, meta.spender);
+  const { token, sym, dec } = await getTokenMeta(meta.token);
+  if (!mySession(n)) return false;
 
-  if (allowance >= q.amount) {
-    log(`Approve not needed. allowance=${formatAmount(allowance, q.dec)} ${q.sym}`);
+  const amountStr = $("amount").value.trim();
+  const amount = parseAmount(amountStr, dec);
+
+  const allowance = await token.allowance(userAddress, meta.spender);
+  if (allowance >= amount) {
+    log(`Approve not needed. allowance=${formatAmount(allowance, dec)} ${sym}`);
     return true;
   }
 
-  const tokenWithSigner = token.connect(signer);
-  log(`Approving spender=${meta.spender} for ${q.amountStr} ${q.sym}...`);
-  const tx = await tokenWithSigner.approve(meta.spender, q.amount);
+  log(`Approving spender=${meta.spender} for ${amountStr} ${sym}...`);
+  const tx = await token.connect(signer).approve(meta.spender, amount);
   log(`Approve tx: ${tx.hash}`);
   await tx.wait();
   log(`Approve confirmed.`);
@@ -310,153 +333,114 @@ async function approveIfNeeded(q) {
 }
 
 async function send() {
-  const q = await quote();
-  if (!q) return;
+  const n = sessionNonce;
+  if (!signer) throw new Error("Not connected");
 
-  await approveIfNeeded(q);
+  const q = await quote(); // always re-quote so msg.value is exact
+  if (!q || !mySession(n)) return;
 
-  const meta = q.meta;
+  await approveIfNeeded();
+  if (!mySession(n)) return;
 
-  // fee struct
   const fee = { nativeFee: q.nativeFee, lzTokenFee: 0n };
 
-  log(`Sending via sendOn=${meta.sendContract} with msg.value=${ethers.formatEther(q.nativeFee)} ${meta.from.currency}...`);
+  log(`Sending via ${q.meta.sendContract} with msg.value=${ethers.formatEther(q.nativeFee)} ETH...`);
 
   try {
-    if (getDirection() === "BASE_TO_LINEA") {
-      // IMPORTANT FIX: send on ROUTER
-      const router = new ethers.Contract(meta.sendContract, ROUTER_ABI, signer);
-      const tx = await router.send(q.sendParam, fee, userAddress, { value: q.nativeFee });
-      log(`Send tx: ${tx.hash}`);
-      const rcpt = await tx.wait();
-      log(`Send confirmed (source chain). status=${rcpt.status}. Delivery is async.`);
-      return;
-    }
-
-    // LINEA_TO_BASE: send on ADAPTER
-    const sender = new ethers.Contract(meta.sendContract, OFT_ABI, signer);
-    const tx = await sender.send(q.sendParam, fee, userAddress, { value: q.nativeFee });
+    const sender = new ethers.Contract(q.meta.sendContract, q.meta.sendAbi, signer);
+    const tx = await sender.send(q.p, fee, userAddress, { value: q.nativeFee });
     log(`Send tx: ${tx.hash}`);
     const rcpt = await tx.wait();
-    log(`Send confirmed (source chain). status=${rcpt.status}. Delivery is async.`);
+    log(`Send confirmed. status=${rcpt.status} (delivery is async across chains)`);
   } catch (e) {
     log(`Send failed: ${e?.shortMessage || e?.message || e}`);
-    log(`If it says "missing revert data", use Simulate with Debug RPC to extract selector + args.`);
+    log(`Tip: If it says "missing revert data", use Debug RPC + Simulate to extract selector.`);
   }
 }
 
 async function refreshAll() {
-  if (!browserProvider || !signer || !userAddress) return;
+  const n = sessionNonce;
+  if (!signer) return;
 
   const meta = directionMeta();
+  setDirectionHint(meta);
+
   const chainId = await getChainId();
-  $("netLine").textContent = `Network: ${chainId}`;
+  $("netLine").textContent = `Network: ${chainId ?? "—"}`;
   $("spenderLine").textContent = meta.spender;
   $("senderLine").textContent = meta.sendContract;
 
-  // IMPORTANT FIX: only read token meta on the chain where the token exists
-  if (chainId !== meta.from.chainId) {
-    $("balLine").textContent = `Balance: — (switch to ${meta.from.name})`;
-    $("peerLine").textContent = `— (switch to ${meta.from.name} to read peer)`;
-    return;
-  }
-
   try {
     const { token, sym, dec } = await getTokenMeta(meta.token);
+    if (!mySession(n)) return;
+
     const bal = await token.balanceOf(userAddress);
     $("balLine").textContent = `Balance: ${formatAmount(bal, dec)} ${sym}`;
 
-    const allowance = await token.allowance(userAddress, meta.spender);
-    log(`Diag: chain=${meta.from.name} balance=${formatAmount(bal, dec)} ${sym} allowance=${formatAmount(allowance, dec)} ${sym}`);
-
-    const peer = await readPeer(meta.peerReader, meta.to.eid);
-    $("peerLine").textContent = `${peer.asAddr} (bytes32: ${peer.peerBytes32})`;
+    if (chainId === meta.from.chainId) {
+      const allowance = await token.allowance(userAddress, meta.spender);
+      log(`Diag: chain=${meta.from.name} balance=${formatAmount(bal, dec)} ${sym} allowance=${formatAmount(allowance, dec)} ${sym}`);
+    }
   } catch (e) {
     log(`Refresh error: ${e?.shortMessage || e?.message || e}`);
   }
 }
 
-// ===== Debug simulation =====
 async function simulateViaDebugRPC() {
-  const meta = directionMeta();
-  const chainId = await getChainId();
-
-  if (chainId !== meta.from.chainId) {
-    log(`Simulate: wrong network. Switch to ${meta.from.name} first.`);
-    return;
-  }
-
-  const rpc = (meta.from.chainId === CHAINS.LINEA.chainId) ? $("rpcLinea").value.trim() : $("rpcBase").value.trim();
-  if (!rpc) {
-    log(`Simulate failed: No Debug RPC URL set for ${meta.from.name}.`);
-    return;
-  }
+  const n = sessionNonce;
+  if (!signer) throw new Error("Not connected");
 
   const q = await quote();
-  if (!q) return;
+  if (!q || !mySession(n)) return;
 
-  // encode call for whichever contract we actually send on
-  let to, iface, data;
-
-  if (getDirection() === "BASE_TO_LINEA") {
-    to = meta.sendContract; // router
-    iface = new ethers.Interface(ROUTER_ABI);
-    data = iface.encodeFunctionData("send", [q.sendParam, { nativeFee: q.nativeFee, lzTokenFee: 0n }, userAddress]);
-  } else {
-    to = meta.sendContract; // adapter
-    iface = new ethers.Interface(OFT_ABI);
-    data = iface.encodeFunctionData("send", [q.sendParam, { nativeFee: q.nativeFee, lzTokenFee: 0n }, userAddress]);
+  const rpc = (q.meta.from.chainId === CHAINS.LINEA.chainId) ? $("rpcLinea").value.trim() : $("rpcBase").value.trim();
+  if (!rpc) {
+    log(`Simulate failed: No Debug RPC URL set for ${q.meta.from.name}.`);
+    return;
   }
 
-  log(`SIMULATE (Debug RPC): ${meta.from.name} call to ${to}`);
-  log(`  rpc=${rpc}`);
-  log(`  from=${userAddress}`);
-  log(`  value=${ethers.formatEther(q.nativeFee)} ETH`);
+  const iface = new ethers.Interface(q.meta.sendAbi);
+  const data = iface.encodeFunctionData("send", [q.p, { nativeFee: q.nativeFee, lzTokenFee: 0n }, userAddress]);
+
+  log(`SIMULATE (Debug RPC): ${q.meta.from.name} send()`);
 
   const payload = {
     jsonrpc: "2.0",
     id: 1,
     method: "eth_call",
-    params: [
-      { to, from: userAddress, data, value: ethers.toBeHex(q.nativeFee) },
-      "latest",
-    ],
+    params: [{
+      to: q.meta.sendContract,
+      from: userAddress,
+      data,
+      value: ethers.toBeHex(q.nativeFee)
+    }, "latest"]
   };
 
   try {
     const res = await fetch(rpc, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(payload)
     });
     const json = await res.json();
 
     if (json.error) {
       const errData = json.error?.data;
       log(`eth_call reverted. message=${json.error?.message || "—"}`);
+
       if (typeof errData === "string" && errData.startsWith("0x")) {
         log(`FOUND revert hex: ${errData}`);
         log(`selector: ${errData.slice(0, 10)}`);
       } else {
-        log(`No revert hex. Full error: ${JSON.stringify(json.error)}`);
+        log(`No revert hex found. Full error: ${JSON.stringify(json.error)}`);
       }
       return;
     }
 
-    log(`eth_call OK (no revert). result=${String(json.result || "").slice(0, 66)}`);
+    log(`eth_call OK (no revert). result=${(json.result || "").slice(0, 66)}...`);
   } catch (e) {
     log(`Simulate failed: ${e?.message || e}`);
   }
-}
-
-// ========= Connect =========
-async function connect() {
-  const eth = requireEthereum();
-  installChainListeners();
-  await eth.request({ method: "eth_requestAccounts" });
-  await initProviderAndSigner();
-  log(`Connected: ${userAddress}`);
-  await refreshAll();
 }
 
 // ========= Wire up UI =========
@@ -466,30 +450,28 @@ $("btnSwitchBase").onclick = () => switchNetwork(CHAINS.BASE.chainId).catch(e =>
 
 $("btnRefresh").onclick = () => refreshAll();
 $("btnQuote").onclick = () => quote().catch(e => log(`Quote failed: ${e?.shortMessage || e?.message || e}`));
-$("btnApprove").onclick = async () => {
-  try {
-    const q = await quote();
-    if (q) await approveIfNeeded(q);
-  } catch (e) {
-    log(`Approve flow failed: ${e?.message || e}`);
-  }
+$("btnApprove").onclick = () => approveIfNeeded().catch(e => log(`Approve failed: ${e?.shortMessage || e?.message || e}`));
+$("btnSend").onclick = () => send().catch(e => log(`Send flow failed: ${e?.shortMessage || e?.message || e}`));
+$("btnSimulate").onclick = () => simulateViaDebugRPC().catch(e => log(`Simulate failed: ${e?.message || e}`));
+
+$("btnClear").onclick = () => {
+  logEl.textContent = "";
+  localStorage.removeItem(LOG_KEY);
 };
-$("btnSend").onclick = () => send().catch(e => log(`Send flow failed: ${e?.message || e}`));
-$("btnSimulate").onclick = () => simulateViaDebugRPC().catch(e => log(`Simulate flow failed: ${e?.message || e}`));
-$("btnClear").onclick = () => { logEl.textContent = ""; };
 
 $("direction").onchange = () => {
   $("feeLine").textContent = "—";
+  $("peerLine").textContent = "—";
   refreshAll();
 };
 
 window.addEventListener("load", () => {
+  loadLog();
+  $("netLine").textContent = "Network: —";
   $("walletLine").textContent = "Not connected";
   $("spenderLine").textContent = "—";
   $("senderLine").textContent = "—";
   $("peerLine").textContent = "—";
   $("feeLine").textContent = "—";
-  $("balLine").textContent = "Balance: —";
-  $("netLine").textContent = "Network: —";
   log(`Ready. Click "Connect Wallet".`);
 });
